@@ -1,0 +1,89 @@
+# SilverFW EasyAllow definition list
+#
+# This file is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This file is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+
+# NOTE: This is not a SilverFW configuration file. Edit silverfw.conf,
+# not this file. This file provides pre-defined rules that can be used
+# in silverfw.conf
+
+# Syntax:
+# type_NAME = port/prot
+#
+# Types are: out for outgoing, in for incoming and both for both
+# Prot can be tcp, udp or all (all for both tcp and udp)
+# You can define port ranges, or single ports. Ranges are defined as
+# FIRST:LAST.
+# The name must be A-Za-z0-9
+#
+# Ex:
+# out_ssh = 22/tcp
+# or
+# out_ftp = 21/all
+#
+# Prot can also be easyallow which lets you have easyallow definitions
+# use other easyallow definitions. This lets you avoid having the same
+# defined multiple times.
+# Ex:
+# out_sshx11 = ssh/easyallow 6010:6016/tcp
+
+# ---
+# Definitions for both outgoing and incoming traffic
+# ---
+
+# SSH
+both_ssh = 22/tcp
+# SSH with X11 forwarding support
+both_sshx11 = ssh/easyallow 6010:6016/tcp
+# HTTP
+both_http = 80/tcp
+# DNS
+both_dns = 53/udp
+# HTTP through SSL
+both_https = 443/tcp
+# Ident
+both_ident = 113/tcp
+# SMTP/Mail
+both_smtp = 25/tcp
+# Internet printing protocol/CUPS
+both_ipp = 631/tcp
+# FTP
+both_ftp = 21/tcp
+# SunRPC/Portmapper
+both_sunrpc = 111/all
+# Day Planner Services
+both_dps = 4435/tcp
+# VNC
+both_vnc = 5900:5903/tcp
+# OpenVPN
+both_openvpn = 1194/udp
+
+# ---
+# Definitions for only incoming traffic
+# ---
+# NFS
+in_nfs = sunrpc/easyallow nfs_core/easyallow 4002/all
+in_nfs_only = sunrpc/easyallow nfs_core/easyallow
+in_nfs_core = 2049/all
+# Bittorrent
+in_bittorrent = 6881:6889/tcp
+# aMule/xMule/lMule
+in_mule = 4665/udp 4672/udp 4662/tcp
+
+# ---
+# Definitions for only outgoing traffic
+# ---
+# Bittorrent
+out_bittorrent = 6969/tcp
+# aMule/xMule/lMule
+out_mule = 4661:4662/udp 4665/tcp 4672/tcp

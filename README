@@ -1,0 +1,48 @@
+SilverFW - iptables-based firewall written in perl
+Written by Eskild Hustvedt
+Licensed under the GNU GPL version 3 or later (see COPYING)
+--------------------------------------------------
+
+OVERVIEW
+- - - - -
+
+SilverFW is a simple iptables-based firewall. The documentation
+is contained in the manpage ./silverfw.8 and as perl POD inside
+the program itself. Access these with either one of these commands:
+$ man ./silverfw.8
+  or
+$ perldoc ./silverfw
+
+After installation just man silverfw should do.
+
+INSTALLATION
+- - - - - - -
+
+If you want to run it manually just run ./silverfw
+If you want to install it run make in this directory as root.
+
+If you don't want to automatically start the firewall when installing
+run make installonly instead.
+
+If you want to install it manually, then read the manual installation
+instructions contained towards the bottom of this document.
+
+In order to upgrade it to a new version just run make from
+the directory containing the new version and it will be automatically
+upgraded.
+
+MANUAL INSTALLATION INSTRUCTIONS
+- - - - - - - - - - - - - - - - -
+
+Copy silverfw.init to /etc/init.d/silverfw and chmod 700 it.
+Then, depending on your distro you can either do chkconfig --add silverfw
+or create the following symlinks:
+# cp ./silverfw /etc/init.d/
+# ln -s /etc/init.d/silverfw /etc/rc2.d/S99silverfw
+# ln -s /etc/init.d/silverfw /etc/rc3.d/S99silverfw
+# ln -s /etc/init.d/silverfw /etc/rc5.d/S99silverfw
+Lastly, you'll want to copy ./silverfw.conf to /etc/silverfw.conf and use that
+to configure SilverFW. Chmod that file to 600.
+
+These directories and when the network starts may be different in your distro
+- make sure you check it.

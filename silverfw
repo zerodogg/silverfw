@@ -1,0 +1,1289 @@
+#!/usr/bin/perl
+# silverfw
+# Copyright (C) Eskild Hustvedt 2007, 2008, 2009
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+use strict;
+use warnings;
+use Getopt::Long;
+use POSIX;
+use FindBin;
+Getopt::Long::Configure ("bundling", 'prefix_pattern=(--|-)');
+
+use constant {
+	true => 1,
+	false => undef,
+};
+
+my %Config = (	# Config file contents
+	EasyAllow_Incoming => '',
+	In_Allow => '',
+	Out_Block => '',
+	EasyAllow_Outgoing => '',
+	Out_Allow => '',
+	Block_ICMP => '',
+	Block_IPs => '',
+	Adv_Settings => '',
+);
+my %EasyAllow;		# Will contain EasyAllow info.
+my %EasyAllowResolved; # Will contain information about EasyAllow strings already committed
+						# used to resolve easyallow deps and avoid eternal dep loops
+my $Verbose = 1;	# Verbose is deault
+my $Version = '0.1';	# Version number
+my $ForceConfig;	# Alternate user-supplied config path
+my $ExitStatus = 0;	# We save the exit status in a variable so that when a error occurs, but
+					# we go on starting the FW we can exit with failure.
+my %ReturnVals;
+# The default configuration file locations
+my @DefaultConfigs = (
+	'/etc/silverfw.conf','/etc/sysconfig/silverfw.conf','./silverfw.conf',
+);
+# The default EasyAllow definitions locations
+my @EasyAllowLocations = (
+	$FindBin::RealBin, '/etc/','/etc/sysconfig/','/usr/share/silverfw/','/usr/share/doc/silverfw/','./',
+);
+if(defined($ENV{HOME})) {
+	push(@EasyAllowLocations,$ENV{HOME});
+	push(@DefaultConfigs, "$ENV{HOME}/silverfw.conf");
+}
+# Fix path in case it isn't proper
+$ENV{PATH} .= ':/sbin:/usr/sbin';
+
+# ---------------------
+# HELPER FUNCTIONS
+# ---------------------
+
+# This makes sure the children are slayed properly and that we keep
+# the return values (in the %ReturnVals hash)
+$SIG{CHLD} = sub {
+	my $PID = wait;
+	$ReturnVals{$PID} = $? >> 8;
+	return(1);
+};
+
+# Purpose: Run a system() in a child (silencing it without using /bin/sh)
+# Usage: SilentSystem(OPTIONS);
+#  OPTIONS are identical to system();
+sub SilentSystem {
+	printcmd(@_);
+	my $PID = fork;
+	my $Return;
+	if($PID) {
+		waitpid($PID,0);
+	} else {
+		open(STDOUT, ">", "/dev/null");
+		open(STDERR, ">", "/dev/null");
+		exec(@_);
+	}
+	return($ReturnVals{$PID});
+}
+
+# Purpose: Return the config file to use or undef
+# Usage: DetectConfig();
+sub DetectConfig {
+	if($ForceConfig) {
+		return($ForceConfig);
+	} else {
+		foreach(@DefaultConfigs) {
+			if(-e $_ and -r $_ and not -d $_) {
+				return($_);
+			}
+		}
+	}
+	return(undef);
+}
+
+# Purpose: Get OS/distro version information
+# Usage: print "OS: ",GetDistVer(),"\n";
+sub GetDistVer {
+	# Try LSB first
+	my %LSB;
+	if (-e '/etc/lsb-release')
+	{
+		LoadConfigFile('/etc/lsb-release',\%LSB);
+		if(defined($LSB{DISTRIB_ID}) and $LSB{DISTRIB_ID} =~ /\S/ and defined($LSB{DISTRIB_RELEASE}) and $LSB{DISTRIB_RELEASE} =~ /\S/)
+		{
+			my $ret = '/etc/lsb-release: '.$LSB{DISTRIB_ID}.' '.$LSB{DISTRIB_RELEASE};
+			if(defined($LSB{DISTRIB_CODENAME}))
+			{
+				$ret .= ' ('.$LSB{DISTRIB_CODENAME}.')';
+			}
+			return($ret);
+		}
+	}
+	# GNU/Linux and BSD
+	foreach(qw/mandriva mandrakelinux mandrake fedora redhat red-hat ubuntu debian gentoo suse distro dist slackware freebsd openbsd netbsd dragonflybsd NULL/) {
+		if (-e "/etc/$_-release" or -e "/etc/$_-version" or -e "/etc/${_}_version" or $_ eq "NULL") {
+			my ($DistVer, $File, $VERSION_FILE);
+			if(-e "/etc/$_-release") {
+				$File = "$_-release";
+				open($VERSION_FILE, '<', "/etc/$_-release");
+				$DistVer = <$VERSION_FILE>;
+			} elsif (-e "/etc/$_-version") {
+				$File = "$_-version";
+				open($VERSION_FILE, '<', "/etc/$_-release");
+				$DistVer = <$VERSION_FILE>;
+			} elsif (-e "/etc/${_}_version") {
+				$File = "${_}_version";
+				open($VERSION_FILE, '<', "/etc/${_}_version");
+				$DistVer = <$VERSION_FILE>;
+			} elsif ($_ eq 'NULL') {
+				last unless -e '/etc/version';
+				$File = 'version';
+				open($VERSION_FILE, '<', '/etc/version');
+				$DistVer = <$VERSION_FILE>;
+			}
+			close($VERSION_FILE);
+			chomp($DistVer);
+			return("/etc/$File: $DistVer");
+		}
+	}
+	# Didn't find anything yet. Get uname info
+	my ($sysname, $nodename, $release, $version, $machine) = POSIX::uname();
+	if ($sysname =~ /darwin/i) {
+		my $DarwinName;
+		my $DarwinOSVer;
+		# Darwin kernel, try to get OS X info.
+		if(InPath('sw_vers')) {
+			if(eval('use IPC::Open2;1')) {
+				if(open2(my $SW_VERS, my $NULL_IN, 'sw_vers')) {
+					while(<$SW_VERS>) {
+						chomp;
+						if (s/^ProductName:\s+//gi) {
+							$DarwinName = $_;
+						} elsif(s/^ProductVersion:\s+//) {
+							$DarwinOSVer = $_;
+						}
+					}
+					close($SW_VERS);
+				}
+			}
+		}
+		if(defined($DarwinOSVer) and defined($DarwinName)) {
+			return("$DarwinName $DarwinOSVer ($machine)");
+		}
+	}
+	# Some distros set a LSB DISTRIB_ID but no version, try DISTRIB_ID
+	# along with the kernel info.
+	if ($LSB{DISTRIB_ID})
+	{
+		return($LSB{DISTRIB_ID}."/Unknown ($sysname $release $version $machine)");
+	}
+	return("Unknown ($sysname $release $version $machine)");
+}
+
+# Purpose: Check if a config value is true
+# Usage: Is_True(value);
+sub Is_True {
+	if(defined($_[0]) and $_[0] =~ /^(true|yes)$/i) {
+		return(1);
+	} else {
+		return(0);
+	}
+}
+
+# Purpose: Print a message while in verbose mode
+# Usage: printv(MESSAGE);
+sub printv {
+	return if not $Verbose == 1 and not $Verbose == 3;
+	print(@_);
+}
+
+# Purpose: Output command in very verbose mode
+# Usage: printcmd(CMD);
+sub printcmd {
+	return if not $Verbose == 2 and not $Verbose == 3;
+	print join(" ",@_)."\n";
+}
+
+# Purpose: Check if a command is in PATH
+# Usage: InPath(command)
+sub InPath {
+	foreach (split /:/, $ENV{PATH}) { if (-x "$_/@_" and not -d "$_/@_" ) {   return 1; } } return 0;
+}
+
+# Purpose: Load the EasyAllow lists
+# Usage: LoadEasyAllowList();
+sub LoadEasyAllowList
+{
+	# If it is already loaded then don't do it all over again
+	return if $EasyAllow{LOADED};
+
+	# Detect the file
+	my $File;
+	foreach(@EasyAllowLocations) {
+		if(-e $_.'/silverfw_easyallow.list' and -r $_.'/silverfw_easyallow.list' and not -d $_.'/silverfw_easyallow.list')
+		{
+			$File = $_.'/silverfw_easyallow.list';
+			last;
+		}
+	}
+	if (defined($_[0]) and $_[0] eq 'ret')
+	{
+		return($File);
+	}
+	if(not $File) {
+		StartFW_Safemode();
+		die("FATAL ERROR: Unable to find EasyAllow definition file! Firewall started in SafeMode.\n");
+	}
+	LoadConfigFile($File, \%EasyAllow, false, false) or die("Errors in the configuration file, unable to continue\n");
+	foreach my $key (keys(%EasyAllow))
+	{
+		if($key =~ /^both/) {
+			my $name = $key;
+			$name =~ s/^both_//;
+			$EasyAllow{"in_$name"} = $EasyAllow{$key};
+			$EasyAllow{"out_$name"} = $EasyAllow{$key};
+			delete($EasyAllow{$key});
+		} elsif(not $key =~ /^(in|out)_/) {
+			warn("EasyAllow: $key: unknown type. Should be either both, in or out. Line ignored.\n");
+			delete($EasyAllow{$key});
+		}
+	}
+	$EasyAllow{LOADED} = true;
+}
+
+# Purpose: Load the config file
+# Usage: LoadSilverFWConfig();
+sub LoadSilverFWConfig {
+	my $File = DetectConfig();
+	die("Unable to detect any configuration file! Try to supply a path with --configfile\n") unless $File;
+
+	my %ConfigOptions = (
+		EasyAllow_Incoming => '^.*$',
+		In_Allow => '.*',
+		Out_Block => '^(yes|no|YES|NO|true|false|TRUE|FALSE)$',
+		EasyAllow_Outgoing => '^.*$',
+		Out_Allow => '.*',
+		Block_ICMP => '^(any|anyecho-reply|echo-reply(pong)destination-unreachable|destination-unreachablenetwork-unreachable|network-unreachablehost-unreachable|host-unreachableprotocol-unreachable|protocol-unreachableport-unreachable|port-unreachablefragmentation-needed|fragmentation-neededsource-route-failed|source-route-failednetwork-unknown|network-unknownhost-unknown|host-unknownnetwork-prohibited|network-prohibitedhost-prohibited|host-prohibitedTOS-network-unreachable|TOS-network-unreachableTOS-host-unreachable|TOS-host-unreachablecommunication-prohibited|communication-prohibitedhost-precedence-violation|host-precedence-violationprecedence-cutoff|precedence-cutoffsource-quench|source-quenchredirect|redirectnetwork-redirect|network-redirecthost-redirect|host-redirectTOS-network-redirect|TOS-network-redirectTOS-host-redirect|TOS-host-redirectecho-request(ping)|echo-request(ping)router-advertisement|router-advertisementrouter-solicitation|router-solicitationtime-exceeded(ttl-exceeded)|time-exceeded(ttl-exceeded)ttl-zero-during-transit|ttl-zero-during-transitttl-zero-during-reassembly|ttl-zero-during-reassemblyparameter-problem|parameter-problemip-header-bad|ip-header-badrequired-option-missing|required-option-missingtimestamp-request|timestamp-requesttimestamp-reply|timestamp-replyaddress-mask-request|address-mask-requestaddress-mask-reply|address-mask-reply|\s)*$',
+		Block_IPs => '^[\s\d\.]*$',
+		Adv_Settings => '^[\w_\s]*$',
+	);
+
+	# Load the configuration file into the %Config hash
+	LoadConfigFile($File, \%Config, \%ConfigOptions, true) or die("Errors in the configuration file, unable to continue\n");
+}
+
+# Purpose: Load a configuration file
+# Usage: LoadConfigFile(/FILE, \%ConfigHash, \%OptionRegexHash, OnlyValidOptions?);
+#  OptionRegeXhash can be available for only a select few of the config options
+#  or skipped completely (by replacing it by undef).
+#  If OnlyValidOptions is true it will cause LoadConfigFile to skip options not in
+#  the OptionRegexHash.
+sub LoadConfigFile {
+	my ($File, $ConfigHash, $OptionRegex, $OnlyValidOptions) = @_;
+
+	my $Status = true;
+
+	open(my $CONFIG, '<', $File) or do {
+		print "Unable to read config settings: $File:$!\n";
+		return(false);
+	};
+	while(<$CONFIG>) {
+		next if m/^\s*(#.*)?$/;
+		next unless m/=/;
+		chomp;
+		my $Option = $_;
+		my $Value = $_;
+		$Option =~ s/^\s*(\S*)\s*=.*/$1/;
+		$Value =~ s/^.*=\s*(.*)\s*/$1/;
+		if($OnlyValidOptions) {
+			unless(defined($OptionRegex->{$Option})) {
+				print ("Unknown configuration option \"$Option\" in $File: Ignored.\n");
+				next;
+			}
+		}
+		unless(defined($Value)) {
+			print ("Empty value for option $Option in $File");
+			$Status = false;
+		}
+		if(defined($OptionRegex) and defined($OptionRegex->{$Option})) {
+			my $MustMatch = $OptionRegex->{$Option};
+			unless ($Value =~ /$MustMatch/) {
+				$Status = false;
+				print "Invalid setting of $Option in the config file: Must match $OptionRegex->{$Option}\n";
+				next;
+			}
+		}
+		$ConfigHash->{$Option} = $Value;
+	}
+	close($CONFIG);
+	return($Status);
+}
+
+# Purpose: Print nicely formatted help output
+# Usage: PrintHelp("-shortoption","--longoption","Description");
+sub PrintHelp {
+	printf "%-4s %-16s %s\n", "$_[0]", "$_[1]", "$_[2]";
+}
+
+# Purpose: Wrapper around system() that complains loudly if a command fails
+# Usage: safeSystem(CMD);
+# 	Completely syntax-compatible with system() HOWEVER the program may die()
+# 	when running it.
+sub safeSystem
+{
+	printcmd(@_);
+	my $ret = system(@_);
+	if(not $ret == 0)
+	{
+		warn("Command failed: ".@_.". Will continue processing, but the firewall might be left in a bad state\n");
+		$ExitStatus = 1;
+	}
+}
+
+# Purpose: Go into daemon mode
+# Usage: Daemonize();
+sub Daemonize
+{
+	# Fork
+	my $PID = fork;
+	exit if $PID;
+	die "Unable to fork: $!\n" if not defined($PID);
+	# Create a new session
+	setsid() or warn("Unable to start a new POSIX session (setsid()): $!");
+	# Change dir to / - this to avoid clogging up a mountpoint
+	chdir('/') or warn("Unable to chdir to /: $!");
+	my $Logfile = '/root/silverfw.pani.log';
+	open(STDIN, '<', '/dev/null') or warn("Unable to reopen STDIN: $!");
+	open(STDOUT, '>>', $Logfile) or warn("Unable to reopen STDOUT: $!");
+	open(STDERR, '>>', $Logfile) or warn("Unable to reopen STDERR: $!");
+}
+
+# ---------------------
+# FIREWALL FUNCTIONS
+# ---------------------
+
+# Purpose: Output information about the ports opened
+# Usage: PortOutInfo(IN_OUT,prot,IP,port, lastport?);
+sub PortOutInfo
+{
+	my $inout = shift;
+	my $prot = shift;
+	my $IP = shift;
+	my $port = shift;
+	my $lastport = shift;
+
+	my $FORTO_STR;
+	my $TYPE_STR;
+	if ($inout eq 'in')
+	{
+		$FORTO_STR = 'for';
+		$TYPE_STR = 'incoming';
+	}
+	elsif ($inout eq 'out')
+	{
+		$FORTO_STR = 'to';
+		$TYPE_STR = 'outgoing';
+	}
+	else
+	{
+		die("Assertion failed: inout=$inout, must be either 'in' or 'out'");
+	}
+
+	my $PROT_STR;
+	if ($prot eq 'tcp')
+	{
+		$PROT_STR = 'TCP';
+	}
+	elsif ($prot eq 'udp')
+	{
+		$PROT_STR = 'UDP';
+	}
+	elsif($prot eq 'all')
+	{
+		$PROT_STR = 'TCP+UDP';
+	}
+	else
+	{
+		die("Assertion failed: prot=$prot, must be either 'tcp','udp','all'");
+	}
+
+	printv " Allowing $TYPE_STR $PROT_STR on";
+	if($lastport)
+	{
+		printv " ports $port to $lastport";
+	}
+	else
+	{
+		printv " port $port";
+	}
+	if ($IP)
+	{
+		if ($IP =~ /,/)
+		{
+			printv " $FORTO_STR the following IPs: $IP";
+		}
+		else
+		{
+			printv " $FORTO_STR the IP address $IP";
+		}
+	}
+	printv "\n";
+}
+
+# Purpose: Commit a range of ports
+# Usage: CommitPortRange(SUB,TCP,UDP,IPBlock);
+sub CommitPortRange
+{
+	my $type = shift;
+	my $TCPRange = shift;
+	my $UDPRange = shift;
+	my $IPBlock = shift;
+	my $runSub;
+	if($type eq 'in') {
+		$runSub = \&AllowIncoming;
+	} else {
+		$runSub = \&AllowOutgoing;
+	}
+
+	# 0 = Single
+	# 1 = Identical
+	# 2 = Differs
+	my $MultiMode;
+
+	# If we don't have /:/ then there's no range to commit, so just run it.
+	if (defined($TCPRange) and defined($UDPRange) and $TCPRange eq $UDPRange and not $TCPRange =~ /:/)
+	{
+		PortOutInfo($type,'all',$IPBlock,$TCPRange);
+		return $runSub->($TCPRange,$UDPRange,$IPBlock);
+	}
+	elsif(defined($TCPRange) and not $TCPRange =~ /:/)
+	{
+		PortOutInfo($type,'tcp',$IPBlock,$TCPRange);
+		return $runSub->($TCPRange,$UDPRange,$IPBlock);
+	}
+	elsif(defined($UDPRange) and not $UDPRange =~ /:/)
+	{
+		PortOutInfo($type,'udp',$IPBlock,$UDPRange);
+		return $runSub->($TCPRange,$UDPRange,$IPBlock);
+	}
+
+	# Detect mode.
+	if ($TCPRange and $UDPRange)
+	{
+		if ($TCPRange eq $UDPRange)
+		{
+			$MultiMode = 1;
+		}
+		else
+		{
+			$MultiMode = 2;
+		}
+	}
+	else
+	{
+		$MultiMode = 0;
+	}
+
+	# We've got a single range. Commit that.
+	if ($MultiMode == 0)
+	{
+		if ($TCPRange)
+		{
+			my $range = ParsePortRange($TCPRange);
+			PortOutInfo($type,'tcp',$IPBlock,$range->[0],$range->[-1]);
+			foreach my $part(@{$range})
+			{
+				$runSub->($part,$part,$IPBlock);
+			}
+		}
+		elsif($UDPRange)
+		{
+			my $range = ParsePortRange($TCPRange);
+			PortOutInfo($type,'udp',$IPBlock,$range->[0],$range->[-1]);
+			foreach my $part(@{$range})
+			{
+				$runSub->($part,$part,$IPBlock);
+			}
+		}
+		else
+		{
+			warn("BUG! CommitPortRange: MultiMode=0 but no TCPRange nor UDPRange defined\n");
+			return false;
+		}
+	}
+	# We've got multiple ranges, both identical.
+	elsif ($MultiMode == 1)
+	{
+		my $range = ParsePortRange($TCPRange);
+		PortOutInfo($type,'all',$IPBlock,$range->[0],$range->[-1]);
+		foreach my $part(@{$range})
+		{
+			$runSub->($part,$part,$IPBlock);
+		}
+		return true;
+	}
+	# We've got two differing ranges
+	elsif ($MultiMode == 2)
+	{
+		my $TCPrange = ParsePortRange($TCPRange);
+		PortOutInfo($type,'tcp',$IPBlock,$TCPrange->[0],$TCPrange->[-1]);
+		foreach my $part(@{$TCPrange})
+		{
+			$runSub->($part,false,$IPBlock);
+		}
+		my $UDPrange = ParsePortRange($UDPRange);
+		PortOutInfo($type,'udp',$IPBlock,$UDPrange->[0],$UDPrange->[-1]);
+		foreach my $part(@{$UDPrange})
+		{
+			$runSub->(false,$part,$IPBlock);
+		}
+		return true;
+	}
+}
+
+# Purpose: Parse a range of ports into an array of ports
+# Usage: my $arrayRef = ParsePortRange(RANGE);
+sub ParsePortRange
+{
+	my $range = shift;
+	# If we're called on something that isn't a range, try to convert it
+	# into something usable as a return value anyway
+	if(not $range =~ /:/)
+	{
+		return([$range]);
+	}
+	my @Ports;
+	my $first = $range;
+	my $last = $range;
+	$first =~ s/:.*$//;
+	$last =~ s/^.*://;
+
+	if(not $first < $last)
+	{
+		warn("Port range invalid. $first:$last - $first must be higher than $last.\n");
+		return([]);
+	}
+
+	my $currI = $first;
+	while($currI <= $last)
+	{
+		push(@Ports,$currI);
+		$currI++;
+	}
+	return(\@Ports);
+}
+
+# Purpose: Process a line of port definitions
+# Usage: ProcessLine(LINE, In_Out);
+sub ProcessLine
+{
+	my $line = shift;
+	my $type = shift;
+	# Now parse the contents
+	foreach my $part (split(/\s+/, $line)) {
+		my $port = $part;
+		my $prot = $part;
+		my $IPBlock = $part;
+		if($port =~ /\D/) {
+			$port =~ s#^([^/]*)/.*#$1#;
+			$prot =~ s#^[^/]*/([^/]*).*#$1#;
+			$IPBlock =~ s#^[^/]*/[^/]*/([^/]*)#$1#;
+			$port =~ s/\s//g;
+			$prot =~ s/\s//g;
+			if(not $IPBlock eq $part) {
+				$IPBlock =~ s/\s//g;
+			} else {
+				$IPBlock = undef;
+			}
+		}
+
+		# Verify the syntax
+		if(not $port and $prot) {
+			warn("Error in port definition: $line: $part: unable to parse! Port ignored.\n");
+			next;
+		}
+		# Verifies the protocol
+		if(not $prot =~ /^(tcp|udp|all|easyallow)$/ and not $prot eq $port) {
+			warn("Error in port definition: $line: $part: invalid protocol '$prot'. Must be one of tcp, udp, all or be empty. Port ignored.\n");
+			next;
+		}
+		if (not $prot eq 'easyallow' and not $port =~ /^[\d:]+$/) {
+			warn("Error in port definition: $line: $part: invalid port '$port'. Ports must be only numeric");
+			next;
+		}
+		# Verifies IPBlock
+		if ($IPBlock and not $IPBlock =~ /^(\d|,|\.)+$/) {
+			warn("Error in port definition: $line: $part: invalid IPs '$IPBlock'. Must be digits, dots and commas (no IPv6 support)");
+			next;
+		}
+
+		if($prot eq 'all' or $prot eq $port) {
+			CommitPortRange($type,$port,$port,$IPBlock);
+		} elsif($prot eq 'tcp') {
+			CommitPortRange($type,$port,false,$IPBlock);
+		} elsif($prot eq 'udp') {
+			CommitPortRange($type,false,$port,$IPBlock);
+		} elsif($prot eq 'easyallow') {
+			if($IPBlock) {
+				$port .= '/'.$IPBlock
+			}
+			CommitEasyAllow($type,$port);
+		} else {
+			warn("BUG! $line: $type: $port/$prot - unknown protocol and SilverFW didn't error out");
+		}
+	}
+}
+
+# Purpose: Set an incoming rule
+# Usage: AllowIncoming(TCP_PORT,UDP_PORT);
+sub AllowIncoming {
+	my($TCP_Port,$UDP_Port,$IP) = @_;
+
+	if($IP and $IP =~ /,/) {
+		foreach(split(/,/,$IP)) {
+			AllowIncoming($TCP_Port,$UDP_Port,$_);
+		}
+		return;
+	}
+
+	if($TCP_Port) {
+		if($IP) {
+			safeSystem('iptables', '-A', 'INPUT', '-p', 'tcp', '--dport', $TCP_Port, '--src', $IP, '-m', 'state', '--state', 'NEW', '-j', 'ACCEPT');
+		} else {
+			safeSystem('iptables', '-A', 'INPUT', '-p', 'tcp', '--dport', $TCP_Port, '-m', 'state', '--state', 'NEW', '-j', 'ACCEPT');
+		}
+	}
+	if($UDP_Port) {
+		if($IP) {
+			safeSystem('iptables', '-A', 'INPUT', '-p', 'udp', '--dport', $UDP_Port, '--src', $IP, '-m', 'state', '--state', 'NEW', '-j', 'ACCEPT');
+		} else {
+			safeSystem('iptables', '-A', 'INPUT', '-p', 'udp', '--dport', $UDP_Port, '-m', 'state', '--state', 'NEW', '-j', 'ACCEPT');
+		}
+	}
+}
+
+# Purpose: Set an outgoing rule
+# Usage: AllowOutgoing(TCP_PORT,UDP_PORT);
+sub AllowOutgoing {
+	my($TCP_Port,$UDP_Port) = @_;
+
+	if($TCP_Port) {
+		safeSystem('iptables', '-A', 'OUTPUT', '-p', 'tcp', '--dport', $TCP_Port, '-m', 'state', '--state', 'NEW,RELATED,ESTABLISHED', '-j', 'ACCEPT');
+		safeSystem('iptables', '-A', 'OUTPUT', '-p', 'tcp', '--sport', $TCP_Port, '-m', 'state', '--state', 'NEW,RELATED,ESTABLISHED', '-j', 'ACCEPT');
+	}
+	if($UDP_Port) {
+		safeSystem('iptables', '-A', 'OUTPUT', '-p', 'udp', '--dport', $UDP_Port, '-m', 'state', '--state', 'NEW,RELATED,ESTABLISHED', '-j', 'ACCEPT');
+		safeSystem('iptables', '-A', 'OUTPUT', '-p', 'udp', '--sport', $UDP_Port, '-m', 'state', '--state', 'NEW,RELATED,ESTABLISHED', '-j', 'ACCEPT');
+	}
+}
+
+# Purpose: Set the main permissions
+# Usage: SetMainPerms();
+sub SetMainPerms {
+	printv 'Flushing current tables...';
+	safeSystem('iptables', '-F');
+	safeSystem('iptables', '-X');
+	safeSystem('iptables', '-Z');
+	printv "done\n";
+	printv 'Setting main permissions...';
+	# Drop INPUT by default
+	safeSystem('iptables', '-P', 'INPUT', 'DROP');
+	# Information flows freely on the loopback interface
+	safeSystem('iptables', '-A', 'INPUT', '-i', 'lo', '-j', 'ACCEPT');
+	# Drop INVALID without further processing
+	safeSystem('iptables','-A','INPUT', '-m', 'state', '--state', 'INVALID','-j','DROP');
+	# Allow all ESTABLISHED and RELATED
+	safeSystem('iptables', '-A', 'INPUT', '-m', 'state', '--state', 'ESTABLISHED,RELATED', '-j', 'ACCEPT');
+	# Make sure NEW packages are SYN, if not - drop
+	safeSystem('iptables', '-A', 'INPUT', '-p', 'tcp', '!', '--syn', '-m', 'state', '--state', 'NEW', '-j', 'DROP');
+	# Drop FORWARD
+	safeSystem('iptables', '-P', 'FORWARD', 'DROP');
+
+	# Accept or allow output depending on conf setting
+	if(Is_True($Config{'Out_Block'})) {
+		# DENY outbound traffic not explicitly allowed
+		safeSystem('iptables', '-P', 'OUTPUT', 'DROP');
+		safeSystem('iptables', '-A', 'OUTPUT', '-o', 'lo', '-j', 'ACCEPT');
+	} else {
+		# ACCEPT all outbound traffic
+		safeSystem('iptables', '-P', 'OUTPUT', 'ACCEPT');
+	}
+	printv "done\n";
+}
+
+# Purpose: Commit AdvSettings
+# Usage: CommitAdvUserSettings();
+sub CommitAdvUserSettings
+{
+	foreach my $setting (split(/\s+/,$Config{Adv_Settings})) {
+		if($setting eq 'IRC_Modules') {
+			printv " Modprobing ip_conntrack and ip_nat_irc\n";
+			safeSystem('modprobe','ip_conntrack_irc');
+			safeSystem('modprobe','ip_nat_irc');
+		} elsif($setting eq 'ScanBlock') {
+			printv " Adding paranoid rules to attempt to block stealth scanning...";
+			safeSystem('iptables','-A','INPUT','-p','tcp','--tcp-flags','ALL','NONE','-j','DROP');
+			safeSystem('iptables','-A','INPUT','-p','tcp','--tcp-flags','ALL','ALL','-j','DROP');
+			safeSystem('iptables','-A','INPUT','-p','tcp','--tcp-flags','ALL','FIN,URG,PSH','-j','DROP');
+			safeSystem('iptables','-A','INPUT','-p','tcp','--tcp-flags','ALL','SYN,RST,ACK,FIN,URG','-j','DROP');
+			safeSystem('iptables','-A','INPUT','-p','tcp','--tcp-flags','SYN,RST','SYN,RST','-j','DROP');
+			safeSystem('iptables','-A','INPUT','-p','tcp','--tcp-flags','SYN,FIN','SYN,FIN','-j','DROP');
+			printv "done\n";
+		} else {
+			warn " Warning: Unknown Adv_Setting: $setting\n";
+		}
+	}
+}
+
+# Purpose: Commit the settings in the config file
+# Usage: CommitUserSettings();
+sub CommitUserSettings {
+	if (defined($_[0]) and $_[0] eq 'tmp')
+	{
+		printv "Committing temporary settings: \n";
+	}
+	else
+	{
+		printv "Committing user settings: \n";
+	}
+
+	# ---
+	# Incoming port settings
+	# ---
+
+	ProcessLine($Config{In_Allow},'in');
+	# EasyAllow settings
+	CommitEasyAllow('in',$Config{EasyAllow_Incoming});
+
+	# ---
+	# Outgoing port settings
+	# ---
+	if(Is_True($Config{'Out_Block'})) {
+		ProcessLine($Config{Out_Allow},'out');
+		# EasyAllow settings
+		CommitEasyAllow('out',$Config{EasyAllow_Outgoing});
+	}
+
+	# ---
+	# Other settings
+	# ---
+
+	# ICMP blocking
+	foreach my $BLOCK_ICMP (split(/\s+/, $Config{Block_ICMP})) {
+		printv " Blocking ICMP request \"$BLOCK_ICMP\"\n";
+		safeSystem('iptables','-A','INPUT','-p','ICMP','--icmp-type',$BLOCK_ICMP,'-j','DROP');
+	}
+
+	# Block IPs?
+	foreach my $IP (split(/\s+/,$Config{Block_IPs}))
+	{
+		printv " Blocking access to and from $IP\n";
+		safeSystem('iptables','-A','INPUT','-s',$IP,'-j','DROP');
+		safeSystem('iptables','-A','OUTPUT','-d',$IP,'-j','DROP');
+	}
+
+	# Parse Adv_Settings
+	CommitAdvUserSettings();
+}
+
+# Purpose: Stop the firewall (allow everything)
+# Usage: StopFW();
+sub StopFW {
+	printv 'Shutting down the firewall...';
+	safeSystem('iptables','-F','INPUT');
+	safeSystem('iptables','-F','FORWARD');
+	safeSystem('iptables','-P','INPUT','ACCEPT');
+	safeSystem('iptables','-P','FORWARD','ACCEPT');
+	printv "done\n";
+	if(not $_[0]) {
+		printv "\nNOTE: You no longer have any firewall rules running.\nAll ports are open!\n";
+	}
+}
+
+# Purpose: Start the firewall
+# Usage: StartFW();
+sub StartFW {
+	LoadSilverFWConfig();
+	SetMainPerms();
+	CommitUserSettings();
+}
+
+# Purpose: Temporarily add some rules from ARGV
+# Usage: StartFW_temp();
+sub StartFW_temp
+{
+	shift(@ARGV);
+	%Config = (
+		EasyAllow_Incoming => '',
+		In_Allow => '',
+		Out_Block => '',
+		Out_Allow => '',
+		EasyAllow_Outgoing => '',
+		Block_ICMP => '',
+		Adv_Settings => '',
+		Block_IPs => '',
+	);
+	foreach(@ARGV)
+	{
+		# Try to process easyallow
+		if (m#/#)
+		{
+			$Config{In_Allow} .= $_.' ';
+		}
+		elsif(/^\d+$/)
+		{
+			$Config{In_Allow} .= $_.'/all ';
+		}
+		else
+		{
+			$Config{In_Allow} .= $_.'/easyallow ';
+		}
+	}
+	CommitUserSettings('tmp');
+}
+
+# Purpose: Parse and set easyallow ports
+# Usage: CommitEasyAllow('type','string');
+sub CommitEasyAllow
+{
+	my $type = shift;
+	my $easyallow = shift;
+	return if not length($easyallow);
+	LoadEasyAllowList();
+	foreach my $opt (split(/\s+/,$easyallow)) {
+		my $IP = $opt;
+		$opt =~ s/\/.*$//;
+		$IP =~ s/^\w+\///;
+		if($IP eq $opt) {
+			$IP = '';
+		}
+		if(not $EasyAllow{$type.'_'.$opt}) {
+			printv "Warning: EasyAllow for \"$opt\" not found. Skipping.\n";
+			next;
+		}
+		# If this has already been comitted then skip it
+		next if ($EasyAllowResolved{$type.'_'.$opt.'_'.$IP});
+		# Add it to the resolved list
+		$EasyAllowResolved{$type.'_'.$opt.'_'.$IP} = true;
+		# The line
+		my $Line = $EasyAllow{$type.'_'.$opt};
+		if($IP) {
+			$Line =~ s/(\w)\s/$1\/$IP /g;
+			$Line .= "/$IP";
+		}
+		# Process the line
+		ProcessLine($Line,$type);
+	}
+}
+
+# Purpose: Start the firewall in safe-mode
+# Usage: StartFW_Safemode();
+sub StartFW_Safemode
+{
+	%Config = (
+		EasyAllow_Incoming => '',
+		In_Allow => '22/tcp',
+		Out_Block => 'yes',
+		Out_Allow => '22/tcp 53/udp',
+		EasyAllow_Outgoing => '',
+		Block_ICMP => 'any',
+		Adv_Settings => 'ScanBlock',
+	);
+	SetMainPerms();
+	CommitUserSettings();
+	printv " Rmmoding ip_conntrack and ip_nat_irc\n";
+	SilentSystem('rmmod ip_conntrack');
+	SilentSystem('rmmod ip_nat_irc');
+}
+
+# Purpose: Start in panic mode
+# Usage: StartFW_PanicMode();
+sub StartFW_PanicMode
+{
+	%Config = (
+		EasyAllow_Incoming => '',
+		In_Allow => '',
+		Out_Block => 'yes',
+		Out_Allow => '',
+		EasyAllow_Outgoing => '',
+		Block_ICMP => 'any',
+		Adv_Settings => 'ScanBlock',
+	);
+	SetMainPerms();
+	CommitUserSettings();
+	printv " Rmmoding ip_conntrack and ip_nat_irc\n";
+	SilentSystem('rmmod ip_conntrack');
+	SilentSystem('rmmod ip_nat_irc');
+	$0 = 'SilverFW [Sleeping for 10 minutes]';
+	sleep(60*10);
+	StopFW(1);
+	StartFW();
+}
+
+# Purpose: Print the SilverFW heading text
+# Usage: PrintHeader();
+sub PrintHeader {
+	printv "This is SilverFW version $Version\nSilverFW comes with ABSOLUTELY NO WARRANTY!\n\n";
+}
+
+GetOptions (
+	'help|h' => sub {
+		print "SilverFW version $Version\n";
+		PrintHelp('-h','--help','Display this help screen');
+		PrintHelp('-v', '--version', 'Display version information and exit');
+		PrintHelp('-s', '--silent', 'Be silent');
+		PrintHelp('-V', '--veryverbose', 'Be very verbose (output every command executed)');
+		PrintHelp('-c', '--configfile','Use an alternate configuration file');
+		PrintHelp('', '--debuginfo','Print debugging information and exit');
+		PrintHelp('','stop','Stop the firewall');
+		PrintHelp('','reload','Stop and start the firewall');
+		PrintHelp('','safemode','Starts SilverFW safemode (blocks everything out and in except on TCP/22)');
+		PrintHelp('','temppanic','Starts SivlerFW temporary panic mode (blocks everything for 10 minutes');
+		PrintHelp('','',' then opens up standard ports again)');
+		PrintHelp('','start','Ignored for initscript compatibility. Default is to start when no');
+		PrintHelp('','','arguments are supplied');
+		PrintHelp('','tempopen','Open up the port definitions set on the commandline for this session.');
+		PrintHelp('','','This does not apply any settings from the config file, it assumes that you');
+		PrintHelp('','','have already started the firewall once');
+		exit(0);
+	},
+	'v|version' => sub {
+		print "SilverFW version $Version\n";
+		exit(0);
+	},
+	'c|configfile=s' => sub {
+		$ForceConfig = $_[1];
+		die("$ForceConfig: does not exist\n") unless -e $ForceConfig;
+		die("$ForceConfig: is not readable\n") unless -r $ForceConfig;
+		die("$ForceConfig: is a directory\n") if -d $ForceConfig;
+	},
+	'debuginfo' => sub {
+		print "SilverFW version $Version\n";
+		my $Conf = DetectConfig();
+		$Conf = $Conf ? $Conf : 'detection failed';
+		print "Config file: $Conf\n";
+		my $EasyAllow = LoadEasyAllowList('ret');
+		$EasyAllow = $EasyAllow ? $EasyAllow : 'detection failed';
+		print "EasyAllow definition file: $EasyAllow\n";
+		printf "Perl version %vd\n", $^V;
+		print 'OS: ', GetDistVer(), "\n";
+		print join(' ', uname()),"\n";
+		safeSystem('iptables','--version');
+		exit(0);
+	},
+	's|silent' => sub {
+		$Verbose = 0;
+	},
+	'V|veryverbose' => sub {
+		if($Verbose == 2) {
+			$Verbose = 3;
+		} else {
+			$Verbose = 2;
+		}
+	},
+) or die "See $0 --help for more information\n";
+
+die("You need to be root to run SilverFW.\n") unless($> == 0);
+die("You don't appear to have iptables installed. Unable to continue.\n") unless InPath('iptables');
+die("Unable to find modprobe\n") unless InPath('modprobe');
+
+# We accept these kinds of parameters for init script compatibility
+if(grep(/^(reload|restart)/i,@ARGV)) {
+	PrintHeader();
+	StopFW(1);
+	StartFW();
+} elsif(grep(/^stop$/i, @ARGV)) {
+	PrintHeader();
+	StopFW();
+} elsif(grep(/^safemode$/i,@ARGV)) {
+	PrintHeader();
+	StartFW_Safemode();
+} elsif(grep(/^temppanic$/i,@ARGV)) {
+	PrintHeader();
+	StartFW_PanicMode();
+} elsif(@ARGV and $ARGV[0] eq 'tempopen') {
+	StartFW_temp();
+} else {
+	PrintHeader();
+	StartFW();
+}
+exit($ExitStatus);
+
+__END__
+
+=head1 NAME
+
+SilverFW - a firewall written in perl
+
+=head1 SYNOPSIS
+
+B<silverfw> [I<OPTIONS>]
+
+=head1 DESCRIPTION
+
+SilverFW is a simple iptables-based port-filterning firewall written in perl.
+It aims at being simple to configure and maintain and therefore
+lacks many of the features that larger firewalls have (but only
+a minority use). SilverFW will block incoming connections on
+ALL ports that it is not specifically told not to block on (with
+the exception of the loopback interface, where it doesn't block anything, ever).
+
+It can also, optionally, be set to block outgoing connections on all
+ports it is not told not to.
+
+After starting the SilverFW firewall you can run the command
+I<iptables -L -v> to view the iptables rules that it has set up.
+
+=head1 OPTIONS
+
+=over
+
+=item B<-h, --help>
+
+Display the help screen.
+
+=item B<-s, --silent>
+
+Be silent.
+
+=item B<-V, --veryverbose>
+
+Output commands instead of information messages. Supply twice to output
+both commands and information messages.
+
+=item B<-v, --version>
+
+Display the version information and exit.
+
+=item B<--debuginfo>
+
+Display debugging information and exit.
+
+=item B<stop>
+
+Stop the firewall.
+
+=item B<restart, reload>
+
+Restart the firewall.
+
+=item B<safemode>
+
+Starts SilverFW in "safemode". This ignores all configuration settings and
+blocks off everything (including ICMP) except incoming on TCP port 22 (ssh) and outgoing on
+TCP port 22 (ssh) and UDP port 53 (DNS).
+
+=item B<start>
+
+Ignored. The default is to start the firewall if no other commandline
+options are supplied.
+
+=item B<tempopen>
+
+Temporarily open the following ports. For instance: tempopen 22:34/tcp
+will open that temporarily as if it was defined in the config file.
+This does NOT apply ANY settings from the config files. It assumes that you have already
+started the firewall (it simply appends the iptables rules).
+All of the following parameters are treated the same way as
+In_Allow= in the config file.
+
+This is useful for when you want to open some ports temporarily, for instance for
+quick lan games. It supports everything you can put in In_Allow in the config file,
+you can even use easyallow, settings by using only the easyallow name omitting protocol and IP
+(if you need to limit it by IP you need to use easyallow as the protocol name, like: ssh/easyallow/10.0.0.4).
+
+None of these settings are permanent, and will be gone the next time you start or restart
+the firewall.
+
+For instance if you want to do some bittorrent, but just temporarily you just do: (sudo) silverfw
+tempopen bittorrent
+
+=back
+
+=head1 CONFIGURATION FILE
+
+All of the settings that takes a space-seperated list can be
+left empty.
+
+=head2 EasyAllow_Incoming
+
+A space-seperated list of service names. SilverFW will allow
+incoming connections using the requried protocols to the services.
+For a list of known EasyAllow services, see the EasyAllow section.
+(default=ssh)
+
+You can limit the setting for certain IP addresses. For instance:
+ssh/10.0.0.5 will only allow ssh for 10.0.0.5.
+ssh/10.0.0.5,10.0.0.6 will do the same for both 10.0.0.5 and 10.0.0.6.
+
+=head2 In_Allow
+
+This is a space seperated list of port numbers and protocol pairs
+that you wish to allow incoming traffic on. The syntax is:
+port/protocol. For instance: 22/tcp will allow incoming on port 22
+using tcp. Supported protocols are udp and tcp. You can also use
+all to open up on both udp and tcp, or leave out /protocol entirely
+to use both udp and tcp.
+
+You can also limit the setting to certain IP addresses. For instance:
+22/tcp/10.0.0.5 will only allow 22 tcp for 10.0.0.5.
+22/tcp/10.0.0.5,10.0.0.6 will do the same for both 10.0.0.5 and 10.0.0.6.
+
+Finally, it is also possible to define port ranges. For instance 22:25/tcp
+will open all ports from 22 to 25 (inclusive). This can be combined with IP
+adresses aswell, for instance 22:25/tcp/10.0.0.4,10.0.0.5
+
+=head2 Block_ICMP
+
+A space-seperated list of ICMP types to block. Run I<iptables -p icmp -h>
+for a list of ICMP types. (default=empty)
+
+=head2 Out_Block
+
+If this is set to yes then SilverFW will block all outgoing traffic
+by default, and only allow outgoing traffic on the ports specified
+in the configuration file. If this is set to no then all outgoing
+traffic will be allowed. (default=no)
+
+=head2 EasyAllow_Outgoing
+
+A space-seperated list of service names. SilverFW will allow
+outgoing connections using the requried protocols to the services.
+For a list of EasyAllow services, see the EasyAllow section.
+(default=ssh)
+This is ignored unless Out_Block is set to yes.
+
+Also the IP limiting will be for destination, instead of source.
+So ssh/10.0.0.5 will allow ssh TO 10.0.0.5 only.
+
+=head2 Out_Allow
+
+Same syntax as In_Allow, but will open outgoing instead of incoming.
+This is ignored unless Out_Block is set to yes.
+
+Also the IP limiting will be for destination, instead of source.
+So tcp/22/10.0.0.5 will allow tcp 22 TO 10.0.0.5 only.
+
+Port ranges can be used as with In_Allow.
+
+=head2 Adv_Settings
+
+Sets some additional settings. It is a space seperated list of
+zero or more of the following:
+
+ Name:                          Action:
+ IRC_Modules                    Modprobes modules to allow IRC DCC through the firewall
+ ScanBlock                      Adds various paranoid rules to attempt to block stealth scanning
+
+=head1 EASYALLOW
+
+EasyAllow is here so that you don't have to remember which ports
+the various services use. It is a little bit more sophisticated
+than simply writing the name from /etc/services rather than the
+port number, as it knows which to open of TCP and UDP aswell,
+and it knows about port dependencies. For instance when you
+use EasyAllow to open up the port for NFS it will open up
+sunrpc aswell automatically.
+
+Note that setting an EasyAllow service that is available
+both for incoming and outgoing on just one of them will
+not open up the other.
+
+ This is a list of known EasyAllow services.
+
+			Outgoing and incoming:
+ Name:                                 EasyAllow name:
+ SSH                                   ssh
+ SSH with X11 forwarding support       sshx11
+ FTP                                   ftp
+ HTTP                                  http
+ HTTPS                                 https
+ DNS                                   dns
+ Ident daemon                          ident
+ SMTP                                  smtp
+ BitTorrent                            bittorrent
+ aMule/lMule/xMule                     mule
+ IPP/CUPS printer server               ipp
+ SunRPC/Portmapper                     sunrpc
+ Day Planner Services                  dps
+ OpenVPN                               openvpn
+ VNC (on :0 through :3)                vnc
+
+			  Only incoming:
+ Name:                                 EasyAllow name:
+ NFS                                   nfs
+
+=head2 NOTES ABOUT NFS
+
+For NFS to work you will, in addition to activating NFS in
+the EasyAllow config, set NFS mountd up to run on port 4002 instead
+of the random one given by the portmapper. On many distributions
+this is set up in /etc/sysconfig/nfs (set MOUNTD_PORT=4002).
+Or in the case of Debian and derivatives, /etc/default/nfs-common
+(set STANDARD_OPTS to --port 4002) or /etc/default/unfs3 (PORT_MOUNT,
+already set by default).
+
+If you don't want to use MOUNTD_PORT (or you're running unfs3 or
+another one that doesn't need it). Use the nfs_only easyallow instead,
+which opens up the nfs and sunrpc ports, but not any mountd port.
+If you want mountd on another port, use nfs_only along with opening
+another port.
+
+=head1 UPGRADING
+
+To upgrade a configuration file from an old version to a new one
+you can use the CCP utility found at http://ccp.nongnu.org/
+
+The command is:
+ ccp --oldfile /PATH/TO/silverfw.conf --newfile ./silverfw.conf --set NoOrphans
+
+For instance if the config file is in /etc that becomes:
+ ccp --oldfile /etc/silverfw.conf --newfile ./silverfw.conf --set NoOrphans
+
+Run it from the directory containing the new version of silverfw.conf
+
+=head1 TECHNICAL INFORMATION
+
+The firewall drops NEW packages that doesn't have the syn flag.
+It lets traffic flow freely on lo. FORWARDing is simply denied.
+Incoming is denied unless explicitly allowed. Everything outgoing
+is allowed by default, but it can be set to deny by default.
+
+Everything that is denied access is DROPped.
+
+=head1 HELP/SUPPORT
+
+If you need help with SilverFW you can, for now, contact me via e-mail.
+
+=head1 AUTHOR
+
+B<SilverFW> is written by Eskild Hustvedt I<<eskild at
+zerodogg
+dot
+org>>
+
+=head1 FILES
+
+=over
+
+=item I</etc/silverfw.conf> or I</etc/sysconfig/silverfw.conf> or
+I<./silverfw.conf> or I<~/silverfw.conf>
+
+The configuration file.
+
+=back
+
+=head1 SEE ALSO
+
+I</etc/services> and L<iptables(8)>
+
+=head1 LICENSE AND COPYRIGHT
+
+Copyright (C) Eskild Hustvedt 2007, 2008, 2009
+
+This is free software; see the source for copying conditions.  There is NO
+warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.

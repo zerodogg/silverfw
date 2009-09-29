@@ -1,0 +1,151 @@
+#!/bin/bash
+# silverfw.init
+# Init script for SilverFW
+# Copyright (C) Eskild Hustvedt 2007, 2009
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+# chkconfig: 2345 09 90
+# description: The SilverFW firewall is a simple firewall.
+#
+### BEGIN INIT INFO
+# Provides: silverfw firewall
+# Default-Start: S 2 3 4 5
+# Default-Stop:
+# Short-Description: SilverFW firewall
+# Description: A simple firewall
+# Required-start:
+# Required-stop:
+### END INIT INFO
+
+# Sanitize PATH
+export PATH="/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin:$PATH"
+
+# Alternative for which that will work predictably everywhere
+function pwhich ()
+{
+	S_IFS="$IFS"
+	IFS=":"
+	for path in $PATH; do
+		if [ -x "$path/$1" ] && [ ! -d "$path/$1" ]; then
+			echo "$path/$1"
+			return
+		fi
+	done
+}
+
+# Silverfw bin detection
+for file in "`pwhich silverfw`" "/usr/sbin/silverfw" "/usr/local/sbin/silverfw"; do
+	if [ -x "$file" ]; then
+		BINFILE="$file"
+	fi
+done
+if [ "$BINFILE" = "" ]; then
+	echo "Unable to detect the silverfw program."
+	exit 1
+fi
+
+# Style detection. We use this to be compatible with multiple distros
+# and look as native as possible on them.
+
+# mdv     = The RedHat/Mandriva-style initscripts
+# LSB     = The LSB-defined (Ubuntu/Debian) initscripts
+# classic = generic init script (no integration/distro functions)
+STYLE=""
+if [ -e "/etc/redhat-relase" ] || [ -e "/etc/mandriva-release" ]; then
+	if [ -e "/etc/rc.d/init.d/functions" ]; then
+		. "/etc/rc.d/init.d/functions"
+		STYLE="mdv"
+	else
+		# Fallback
+		STYLE="classic"
+	fi
+elif [ -e "/lib/lsb/init-functions" ] && [ ! -e "/etc/fedora-release" ]; then
+	. /lib/lsb/init-functions
+	STYLE="LSB"
+	DESC="SilverFW firewall"
+	NAME="silverfw"
+else
+	STYLE="classic"
+fi
+
+start()
+{
+	if [ "$STYLE" = "mdv" ]; then
+		gprintf "Starting %s" "SilverFW"
+		$BINFILE --silent start && success "startup" || failure "startup"
+		echo
+	elif [ "$STYLE" = "LSB" ]; then
+		log_begin_msg "Starting $DESC: $NAME"
+		$BINFILE --silent start
+		log_end_msg $?
+	else
+		$BINFILE start
+	fi
+}
+
+stop()
+{
+	if [ "$STYLE" = "mdv" ]; then
+		gprintf "Stopping %s" "SilverFW"
+		$BINFILE --silent stop && success "stop" || failure "stop"
+		echo
+	elif [ "$STYLE" = "LSB" ]; then
+		log_begin_msg "Stopping $DESC: $NAME"
+		$BINFILE --silent stop
+		log_end_msg $?
+	else
+		$BINFILE stop
+	fi
+}
+restart()
+{
+	if [ "$STYLE" != "" ]; then
+		stop
+		start
+	else
+		$BINFILE restart
+	fi
+}
+reload()
+{
+	# Reloading is simply starting the FW without stopping the old one, so the machine
+	# is never without a running FW
+	if [ "$STYLE" = "mdv" ]; then
+		gprintf "Reloading %s" "SilverFW"
+		$BINFILE --silent start && success "config reload" || failure "config reload"
+		echo
+	elif [ "$STYLE" = "LSB" ]; then
+		log_begin_msg "Reloading $DESC: $NAME"
+		$BINFILE --silent start
+		log_end_msg $?
+	else
+		$BINFILE start
+	fi
+}
+case $1 in
+	start ) start;;
+	stop ) stop;;
+	restart ) restart;;
+	reload ) reload;;
+	* )
+	if [ "$STYLE" = "mdv" ]; then
+		gprintf "Usage: %s {start|stop|restart|reload}\n" "$0"
+	elif [ "$STYLE" = "LSB" ]; then
+		N=/etc/init.d/${0##*/}
+		echo "Usage: $N {start|stop|restart|reload}" >&2
+	else
+		echo "Usage: $0 {start|stop|restart|reload}"
+	fi
+esac
